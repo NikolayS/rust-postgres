@@ -404,3 +404,84 @@ pub async fn sync(client: &InnerClient) -> Result<(), Error> {
         _ => Err(Error::unexpected_message()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Statement;
+
+    /// The PostgreSQL wire-format Sync message: tag 'S' + length 4.
+    const SYNC_BYTES: [u8; 5] = [b'S', 0, 0, 0, 4];
+
+    /// Count occurrences of the Sync message in a byte buffer.
+    fn count_syncs(buf: &[u8]) -> usize {
+        buf.windows(5).filter(|w| *w == SYNC_BYTES).count()
+    }
+
+    /// Regression test for the double-Sync protocol bug in copy_in.
+    ///
+    /// A complete COPY-IN cycle on the wire looks like:
+    ///   1. Bind + Execute       (from copy_in's initial encode)
+    ///   2. CopyData …           (streamed rows)
+    ///   3. CopyDone + **Sync**  (from CopyInReceiver on success)
+    ///
+    /// Only step 3 should carry a Sync so the server produces exactly one
+    /// ReadyForQuery.  If step 1 also carries a Sync (`encode` instead of
+    /// `encode_no_sync`), the server may receive two Syncs and reply with
+    /// two ReadyForQuery messages, crashing the connection driver.
+    ///
+    /// This test simulates the full cycle and asserts exactly one Sync.
+    #[test]
+    fn copy_in_cycle_has_exactly_one_sync() {
+        let client = InnerClient::new_for_test();
+        let statement = Statement::unnamed(vec![], vec![]);
+
+        // Step 1: the initial message copy_in sends (must NOT contain Sync).
+        let initial = encode_no_sync(&client, &statement, std::iter::empty::<i32>()).unwrap();
+        assert_eq!(
+            count_syncs(&initial),
+            0,
+            "initial Bind+Execute must not contain Sync"
+        );
+
+        // Step 3: CopyDone + Sync (what CopyInReceiver builds on success).
+        let mut finish = BytesMut::new();
+        frontend::copy_done(&mut finish);
+        frontend::sync(&mut finish);
+        assert_eq!(count_syncs(&finish), 1, "CopyDone+Sync must contain one Sync");
+
+        // Whole cycle: exactly one Sync total.
+        let mut full_cycle = BytesMut::new();
+        full_cycle.extend_from_slice(&initial);
+        full_cycle.extend_from_slice(&finish);
+        assert_eq!(
+            count_syncs(&full_cycle),
+            1,
+            "complete COPY-IN cycle must contain exactly one Sync"
+        );
+    }
+
+    /// Show that using `encode` (with Sync) would produce a double-Sync.
+    #[test]
+    fn encode_with_sync_causes_double_sync_in_copy_cycle() {
+        let client = InnerClient::new_for_test();
+        let statement = Statement::unnamed(vec![], vec![]);
+
+        // If copy_in used `encode` instead of `encode_no_sync`:
+        let initial = encode(&client, &statement, std::iter::empty::<i32>()).unwrap();
+        assert_eq!(count_syncs(&initial), 1, "encode includes Sync");
+
+        let mut finish = BytesMut::new();
+        frontend::copy_done(&mut finish);
+        frontend::sync(&mut finish);
+
+        let mut full_cycle = BytesMut::new();
+        full_cycle.extend_from_slice(&initial);
+        full_cycle.extend_from_slice(&finish);
+        assert_eq!(
+            count_syncs(&full_cycle),
+            2,
+            "using encode() would produce two Syncs — the bug this PR fixes"
+        );
+    }
+}

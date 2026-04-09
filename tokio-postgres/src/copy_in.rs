@@ -188,13 +188,25 @@ where
     }
 }
 
+/// Encode the initial Bind+Execute for a COPY IN statement.
+///
+/// This is separated from `copy_in` so it can be tested independently.
+/// It must use `encode_no_sync` to avoid producing a double-Sync when
+/// CopyInReceiver later sends its own Sync with CopyDone/CopyFail.
+pub(crate) fn encode_copy_in(
+    client: &InnerClient,
+    statement: &Statement,
+) -> Result<bytes::Bytes, Error> {
+    query::encode_no_sync(client, statement, slice_iter(&[]))
+}
+
 pub async fn copy_in<T>(client: &InnerClient, statement: Statement) -> Result<CopyInSink<T>, Error>
 where
     T: Buf + 'static + Send,
 {
     debug!("executing copy in statement {}", statement.name());
 
-    let buf = query::encode_no_sync(client, &statement, slice_iter(&[]))?;
+    let buf = encode_copy_in(client, &statement)?;
 
     let (mut sender, receiver) = mpsc::channel(1);
     let receiver = CopyInReceiver::new(receiver);
@@ -222,4 +234,32 @@ where
         state: SinkState::Active,
         _p2: PhantomData,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_copy_in;
+    use crate::Statement;
+    use crate::client::InnerClient;
+
+    const SYNC_BYTES: [u8; 5] = [b'S', 0, 0, 0, 4];
+
+    /// Verify that copy_in's initial Bind+Execute message does not contain
+    /// a Sync.  This is the critical property that prevents the double-Sync
+    /// protocol crash: only CopyInReceiver should send Sync (with CopyDone
+    /// or CopyFail).
+    #[test]
+    fn copy_in_initial_message_has_no_sync() {
+        let client = InnerClient::new_for_test();
+        let statement = Statement::unnamed(vec![], vec![]);
+
+        // Call the same encoding function that copy_in() uses.
+        let buf = encode_copy_in(&client, &statement).unwrap();
+
+        let sync_count = buf.windows(5).filter(|w| *w == SYNC_BYTES).count();
+        assert_eq!(
+            sync_count, 0,
+            "copy_in's initial Bind+Execute must not contain a Sync message"
+        );
+    }
 }

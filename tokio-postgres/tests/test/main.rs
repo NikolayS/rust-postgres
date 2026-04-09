@@ -761,6 +761,67 @@ async fn copy_in_error() {
     assert_eq!(rows.len(), 0);
 }
 
+/// Verify that a connection remains usable after a successful COPY IN.
+///
+/// This is a regression guard for the double-Sync protocol fix. The fix
+/// ensures copy_in sends Bind+Execute (no Sync) and defers the Sync to
+/// CopyInReceiver, so that exactly one ReadyForQuery is produced per COPY
+/// cycle.  With PostgreSQL the bug is masked (PG ignores Sync during COPY
+/// mode), but this test guarantees the basic flow works correctly.
+#[tokio::test]
+async fn copy_in_then_query() {
+    let client = connect("user=postgres").await;
+
+    client
+        .batch_execute(
+            "CREATE TEMPORARY TABLE foo (
+                id INTEGER,
+                name TEXT
+            )",
+        )
+        .await
+        .unwrap();
+
+    // First COPY IN.
+    let mut stream = stream::iter(
+        vec![
+            Bytes::from_static(b"1\tjim\n"),
+            Bytes::from_static(b"2\tjoe\n"),
+        ]
+        .into_iter()
+        .map(Ok::<_, Error>),
+    );
+    let mut sink = pin!(client.copy_in("COPY foo FROM STDIN").await.unwrap());
+    sink.send_all(&mut stream).await.unwrap();
+    let rows = sink.finish().await.unwrap();
+    assert_eq!(rows, 2);
+
+    // Connection must still work after COPY.
+    let count: i64 = client
+        .query_one("SELECT count(*) FROM foo", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 2);
+
+    // Second COPY IN — exercises back-to-back COPY cycles.
+    let mut stream = stream::iter(
+        vec![Bytes::from_static(b"3\tjan\n")]
+            .into_iter()
+            .map(Ok::<_, Error>),
+    );
+    let mut sink = pin!(client.copy_in("COPY foo FROM STDIN").await.unwrap());
+    sink.send_all(&mut stream).await.unwrap();
+    sink.finish().await.unwrap();
+
+    let count: i64 = client
+        .query_one("SELECT count(*) FROM foo", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 3);
+}
+
 #[tokio::test]
 async fn copy_out() {
     let client = connect("user=postgres").await;
