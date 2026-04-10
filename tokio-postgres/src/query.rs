@@ -267,13 +267,18 @@ where
     })
 }
 
-/// Like [`encode`] but omits the trailing Sync message.
+/// Like [`encode`] but replaces the trailing Sync with a Flush message.
 ///
-/// Used by `copy_in` where the Sync must be deferred: either sent with
-/// CopyDone (success path) or sent alone when the server rejected the command
-/// before entering copy mode (error path).  Sending two Syncs (one here and
-/// one in CopyInReceiver) would produce two ReadyForQuery messages from the
-/// server, which would crash the connection driver.
+/// Used by `copy_in` where the Sync must be deferred: CopyInReceiver sends
+/// the sole Sync together with CopyDone (success) or CopyFail (error).
+///
+/// Sending two Syncs (one here and one in CopyInReceiver) would produce two
+/// ReadyForQuery messages from the server, crashing the connection driver.
+///
+/// The Flush message forces the server to deliver any buffered output
+/// (BindComplete, CopyInResponse, or ErrorResponse) without producing a
+/// ReadyForQuery, so the client never hangs waiting for a response that is
+/// stuck in the server's output buffer.
 pub fn encode_no_sync<P, I>(
     client: &InnerClient,
     statement: &Statement,
@@ -287,6 +292,7 @@ where
     client.with_buf(|buf| {
         encode_bind(statement, params, "", buf)?;
         frontend::execute("", 0, buf).map_err(Error::encode)?;
+        frontend::flush(buf);
         Ok(buf.split().freeze())
     })
 }
@@ -412,43 +418,50 @@ mod tests {
 
     /// The PostgreSQL wire-format Sync message: tag 'S' + length 4.
     const SYNC_BYTES: [u8; 5] = [b'S', 0, 0, 0, 4];
+    /// The PostgreSQL wire-format Flush message: tag 'H' + length 4.
+    const FLUSH_BYTES: [u8; 5] = [b'H', 0, 0, 0, 4];
 
-    /// Count occurrences of the Sync message in a byte buffer.
     fn count_syncs(buf: &[u8]) -> usize {
         buf.windows(5).filter(|w| *w == SYNC_BYTES).count()
+    }
+
+    fn count_flushes(buf: &[u8]) -> usize {
+        buf.windows(5).filter(|w| *w == FLUSH_BYTES).count()
     }
 
     /// Regression test for the double-Sync protocol bug in copy_in.
     ///
     /// A complete COPY-IN cycle on the wire looks like:
-    ///   1. Bind + Execute       (from copy_in's initial encode)
-    ///   2. CopyData …           (streamed rows)
-    ///   3. CopyDone + **Sync**  (from CopyInReceiver on success)
+    ///   1. Bind + Execute + Flush  (from copy_in's initial encode)
+    ///   2. CopyData …              (streamed rows)
+    ///   3. CopyDone + **Sync**     (from CopyInReceiver on success)
     ///
-    /// Only step 3 should carry a Sync so the server produces exactly one
-    /// ReadyForQuery.  If step 1 also carries a Sync (`encode` instead of
-    /// `encode_no_sync`), the server may receive two Syncs and reply with
-    /// two ReadyForQuery messages, crashing the connection driver.
-    ///
-    /// This test simulates the full cycle and asserts exactly one Sync.
+    /// Only step 3 carries a Sync so the server produces exactly one
+    /// ReadyForQuery.  Step 1 uses Flush (not Sync) to force the server
+    /// to deliver BindComplete/CopyInResponse without a ReadyForQuery.
     #[test]
     fn copy_in_cycle_has_exactly_one_sync() {
         let client = InnerClient::new_for_test();
         let statement = Statement::unnamed(vec![], vec![]);
 
-        // Step 1: the initial message copy_in sends (must NOT contain Sync).
+        // Step 1: Bind + Execute + Flush (no Sync).
         let initial = encode_no_sync(&client, &statement, std::iter::empty::<i32>()).unwrap();
         assert_eq!(
             count_syncs(&initial),
             0,
-            "initial Bind+Execute must not contain Sync"
+            "initial Bind+Execute+Flush must not contain Sync"
+        );
+        assert_eq!(
+            count_flushes(&initial),
+            1,
+            "initial message must contain Flush to force server output"
         );
 
         // Step 3: CopyDone + Sync (what CopyInReceiver builds on success).
         let mut finish = BytesMut::new();
         frontend::copy_done(&mut finish);
         frontend::sync(&mut finish);
-        assert_eq!(count_syncs(&finish), 1, "CopyDone+Sync must contain one Sync");
+        assert_eq!(count_syncs(&finish), 1);
 
         // Whole cycle: exactly one Sync total.
         let mut full_cycle = BytesMut::new();

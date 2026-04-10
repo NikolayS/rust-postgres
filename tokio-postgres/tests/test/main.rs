@@ -822,6 +822,39 @@ async fn copy_in_then_query() {
     assert_eq!(count, 3);
 }
 
+/// Verify the connection survives a copy_in that fails before entering
+/// COPY mode (the server never sends CopyInResponse).
+///
+/// Without the fix this either crashes (double-Sync) or hangs (no flush).
+/// With encode_no_sync+Flush the server flushes its ErrorResponse, the
+/// client reads it, and the connection remains usable.
+#[tokio::test]
+async fn copy_in_error_before_copy_mode() {
+    let (client, connection) = connect_raw("user=postgres").await.unwrap();
+    let connection = tokio::spawn(connection);
+
+    // copy_in with a non-COPY statement: the server processes it as a
+    // normal SELECT, never enters COPY mode.  The Flush forces the server
+    // to deliver its response (BindComplete+DataRow+CommandComplete)
+    // despite no Sync or COPY-mode flush point.
+    let result = client.copy_in::<_, Bytes>("SELECT 1").await;
+    assert!(result.is_err(), "copy_in with SELECT should fail");
+
+    // Give the connection driver time to process CopyInReceiver's
+    // CopyFail+Sync and the server's response.
+    time::sleep(Duration::from_millis(200)).await;
+
+    // Connection must still be usable.
+    let rows = client
+        .query("SELECT 42 AS val", &[])
+        .await
+        .expect("connection should still be usable after copy_in error");
+    assert_eq!(rows[0].get::<_, i32>(0), 42);
+
+    drop(client);
+    connection.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn copy_out() {
     let client = connect("user=postgres").await;
